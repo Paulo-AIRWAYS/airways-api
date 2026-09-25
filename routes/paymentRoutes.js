@@ -1,68 +1,85 @@
 const router = require('express').Router();
-const auth = require('../middleware/auth');
+const axios = require('axios');
 const db = require('../database/db');
+const auth = require('../middleware/auth');
 
-const PLANOS = {
-  '30d':  { nome: 'Plano 30 dias',   dias: 30,  preco: 2990 },
-  '60d':  { nome: 'Plano 60 dias',   dias: 60,  preco: 4990 },
-  '90d':  { nome: 'Plano 90 dias',   dias: 90,  preco: 5990 },
-  '180d': { nome: 'Plano 180 dias',  dias: 180, preco: 8990 },
-  '1a':   { nome: 'Plano Anual',     dias: 365, preco: 11990 }
-};
+const IP_BASE = 'https://api.checkout.infinitepay.io';
+const IP_HANDLE = process.env.IP_INFINITETAG;
 
-router.get('/planos', function (req, res) {
-  res.json({ planos: Object.keys(PLANOS).map(function (id) {
-    return { id: id, nome: PLANOS[id].nome, dias: PLANOS[id].dias, preco: PLANOS[id].preco };
-  }) });
-});
+// 1) Criar checkout (cartão de crédito)
+router.post('/checkout', auth, async (req, res) => {
+  const { plano_id } = req.body;
+  const usuario_id = req.usuario.id;
 
-router.post('/checkout', auth, async function (req, res) {
   try {
-    const planoId = req.body.planoId;
-    const plano = PLANOS[planoId];
-    if (!plano) return res.status(400).json({ error: 'Plano invalido' });
-    if (!req.usuario || !req.usuario.id) return res.status(401).json({ error: 'Usuario nao identificado' });
-    if (!db) return res.status(503).json({ error: 'Banco de dados nao configurado' });
+    const plano = await db.query('select * from planos where id = $1', [plano_id]);
+    if (!plano.rows.length) return res.status(400).json({ error: 'Plano inválido' });
 
-    const result = await db.query(
-      'insert into public.assinaturas (usuario_id, plano_id, gateway, status) values ($1, $2, $3, $4) returning id',
-      [req.usuario.id, planoId, 'manual', 'pendente']
+    const p = plano.rows[0];
+    const order_nsu = `aw-${usuario_id}-${Date.now()}`;
+
+    // grava assinatura pendente
+    const ass = await db.query(
+      `insert into assinaturas (usuario_id, plano_id, gateway, status, pagamento_id)
+       values ($1,$2,'infinitepay','pendente',$3) returning id`,
+      [usuario_id, plano_id, order_nsu]
     );
 
-    res.json({
-      assinaturaId: result.rows[0].id,
-      plano: plano,
-      status: 'pendente',
-      mensagem: 'Pagamento manual: confirme o PIX ou cartao pelo app'
-    });
+    const payload = {
+      handle: IP_HANDLE,
+      items: [{ quantity: 1, price: p.preco_cartao, description: p.nome }],
+      order_nsu,
+      webhook_url: `${process.env.BASE_URL}/api/webhooks/infinitepay`,
+      redirect_url: `${process.env.APP_URL}/obrigado`
+    };
+
+    const { data } = await axios.post(`${IP_BASE}/checkout`, payload);
+    res.json({ url: data.url, order_nsu });
   } catch (e) {
-    res.status(500).json({ error: 'Erro ao criar assinatura' });
+    console.error(e.response?.data || e.message);
+    res.status(500).json({ error: 'Erro ao criar checkout' });
   }
 });
 
-router.post('/confirmar', auth, async function (req, res) {
+// 2) Webhook de confirmação de pagamento
+router.post('/webhooks/infinitepay', async (req, res) => {
+  const body = req.body;
+  res.status(200).json({ ok: true }); // responde rápido (200)
+
   try {
-    const assinaturaId = req.body.assinaturaId;
-    if (!assinaturaId) return res.status(400).json({ error: 'Assinatura nao informada' });
-    if (!db) return res.status(503).json({ error: 'Banco de dados nao configurado' });
+    const order_nsu = body.order_nsu;
+    if (!order_nsu) return;
 
-    const plano = await db.query(
-      'select p.duracao_dias from public.assinaturas a join public.planos p on p.id = a.plano_id where a.id = $1',
-      [assinaturaId]
-    );
-    if (!plano.rows[0]) return res.status(404).json({ error: 'Assinatura nao encontrada' });
+    const ass = await db.query('select * from assinaturas where pagamento_id = $1', [order_nsu]);
+    if (!ass.rows.length) return;
 
+    const a = ass.rows[0];
+    if (a.status === 'ativo') return;
+
+    const plano = await db.query('select * from planos where id = $1', [a.plano_id]);
     const dias = plano.rows[0].duracao_dias;
-    const fim = new Date(Date.now() + dias * 86400000);
+    const inicio = new Date();
+    const fim = new Date(inicio.getTime() + dias * 86400000);
 
     await db.query(
-      'update public.assinaturas set status = $1, data_inicio = now(), data_fim = $2 where id = $3',
-      ['ativa', fim, assinaturaId]
+      `update assinaturas set status='ativo', data_inicio=$1, data_fim=$2 where id=$3`,
+      [inicio, fim, a.id]
     );
-
-    res.json({ status: 'ativa', dataFim: fim });
   } catch (e) {
-    res.status(500).json({ error: 'Erro ao confirmar assinatura' });
+    console.error('webhook infinitepay', e.message);
+  }
+});
+
+// 3) Consultar status (fallback de segurança)
+router.post('/payment-check', auth, async (req, res) => {
+  const { order_nsu, transaction_nsu, slug } = req.body;
+  try {
+    const { data } = await axios.post(`${IP_BASE}/payment_check`, {
+      handle: IP_HANDLE, order_nsu, transaction_nsu, slug
+    });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao consultar pagamento' });
   }
 });
 
