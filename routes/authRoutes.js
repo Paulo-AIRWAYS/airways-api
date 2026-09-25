@@ -21,8 +21,9 @@ router.post('/registrar', async (req, res) => {
     await db.query('update public.usuarios set session_token = $1 where id = $2', [token, usuarioId]);
     res.json({ token: token, usuario: { id: usuarioId, nome: nome, email: email, whatsapp: whatsapp, cidade: cidade } });
   } catch (e) {
-    res.status(500).json({ error: 'Erro ao registrar usuario' });
-  }
+  console.error('ERRO REAL:', e);
+  res.status(500).json({ error: 'Erro ao registrar usuario: ' + (e.message || e) });
+}
 });
 
 router.post('/login', async (req, res) => {
